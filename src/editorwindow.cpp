@@ -16,7 +16,6 @@
 #include "ui/about_dialog.h"
 #include "ui/application.h"
 #include "ui/drag.h"
-#include "ui/dialog_window.h"
 #include "ui/file_chooser.h"
 #include "ui/frame_client.h"
 #include "ui/header_button.h"
@@ -36,9 +35,7 @@
 #include <filesystem>
 
 using namespace cutefish::ui;
-using cutefish::i18n::format;
 using cutefish::i18n::tr;
-using cutefish::i18n::trn;
 namespace strings = cutefish::base::strings;
 
 static constexpr double headerHeight = 40;
@@ -335,19 +332,10 @@ EditorWindow::EditorWindow(EditorApplication &application, Options options)
     addShortcuts();
     buildMainMenu();
 
-    if (options.detachedPage) {
+    if (options.detachedPage)
         insertTab(std::move(options.detachedPage), 0);
-    } else {
-        for (const TabState &state : options.initialTabs) {
-            EditorPage::Options page;
-            page.restoreState = state;
-            page.fromSession = true;
-            newTab(page);
-        }
-        if (m_pages.empty())
-            newTab();
-        selectTab(std::clamp(options.initialIndex, 0, int(m_pages.size()) - 1));
-    }
+    else
+        newTab();
     updateTitle();
 }
 
@@ -368,15 +356,9 @@ void EditorWindow::retranslate()
     m_header->updateLabels();
     updateTitle();
 
-    if (m_statistics && m_statistics->window())
-        showStatistics();
     if (m_preferences && m_preferences->window()) {
         m_preferences.reset();
         showPreferences();
-    }
-    if (m_shortcuts && m_shortcuts->window()) {
-        m_shortcuts.reset();
-        showShortcuts();
     }
     if (m_about && m_about->window()) {
         m_about.reset();
@@ -462,7 +444,6 @@ EditorPage *EditorWindow::newTab(const EditorPage::Options &options, int index)
     auto page = std::make_unique<EditorPage>(m_application, this, options);
     EditorPage *raw = page.get();
     insertTab(std::move(page), index < 0 ? int(m_pages.size()) : index);
-    m_application.scheduleSessionSave();
     return raw;
 }
 
@@ -476,7 +457,6 @@ void EditorWindow::insertTab(std::unique_ptr<EditorPage> page, int index)
     m_content->requestLayout();
     showPage(index);
     raw->focusEditor();
-    m_application.scheduleSessionSave();
 }
 
 std::unique_ptr<EditorPage> EditorWindow::takePage(int index)
@@ -501,7 +481,6 @@ void EditorWindow::showPage(int index)
     for (size_t i = 0; i < m_pages.size(); ++i)
         m_pages[i]->setVisible(int(i) == index);
     pagesChanged();
-    m_application.scheduleSessionSave();
 }
 
 void EditorWindow::selectTab(int index)
@@ -582,23 +561,18 @@ void EditorWindow::openFile(const std::string &path, int line)
 
 void EditorWindow::openText(const std::string &text)
 {
+    const int pristine = isPristine(currentPage()) ? m_currentIndex : -1;
     EditorPage::Options options;
     options.initialText = text;
     newTab(options);
+    if (pristine >= 0)
+        closeTab(pristine, false);
 }
 
 void EditorWindow::openPaths(const std::vector<std::string> &paths)
 {
     if (!paths.empty())
         m_application.openPaths(paths, 0, this);
-}
-
-std::vector<TabState> EditorWindow::sessionTabs() const
-{
-    std::vector<TabState> tabs;
-    for (const EditorPage *page : m_pages)
-        tabs.push_back(page->sessionState());
-    return tabs;
 }
 
 void EditorWindow::confirmDiscard(const std::vector<EditorPage *> &dirty, std::function<void()> action)
@@ -628,23 +602,10 @@ void EditorWindow::closeTab(int index, bool ask)
         });
         return;
     }
-    // Kept for Reopen Closed Tab; an unsaved text stays in its draft.
-    if (!isPristine(page)) {
-        TabState state = page->sessionState();
-        Document &document = page->document();
-        if (document.isModified() || (document.isUntitled() && !document.isEmpty())) {
-            document.writeDraftNow();
-            state.unsaved = true;
-        } else {
-            document.removeDraft();
-        }
-        m_application.pushClosedTab(state);
-    }
     std::unique_ptr<EditorPage> taken = takePage(index);
     // The page may be the one handling this event; it goes once the event is over.
     std::shared_ptr<EditorPage> doomed(std::move(taken));
     cutefish::base::EventLoop::current()->post([doomed] {});
-    m_application.scheduleSessionSave();
     if (m_pages.empty()) {
         m_closeConfirmed = true;
         requestClose();
@@ -659,65 +620,8 @@ void EditorWindow::closeCurrentTab()
     closeTab(m_currentIndex);
 }
 
-void EditorWindow::closeOtherTabs(int index)
-{
-    if (index < 0 || index >= int(m_pages.size()))
-        return;
-    EditorPage *keep = m_pages[size_t(index)];
-    std::vector<EditorPage *> others;
-    std::vector<EditorPage *> dirty;
-    for (EditorPage *page : m_pages) {
-        if (page == keep)
-            continue;
-        others.push_back(page);
-        if (page->document().isModified())
-            dirty.push_back(page);
-    }
-    confirmDiscard(dirty, [this, keep, others, alive = std::weak_ptr<bool>(m_alive)] {
-        if (alive.expired())
-            return;
-        for (EditorPage *page : others)
-            closeTab(indexOfPage(page), false);
-        selectTab(indexOfPage(keep));
-    });
-}
-
-void EditorWindow::closeTabsToRight(int index)
-{
-    std::vector<EditorPage *> right(m_pages.begin() + std::min(index + 1, int(m_pages.size())), m_pages.end());
-    std::vector<EditorPage *> dirty;
-    for (EditorPage *page : right) {
-        if (page->document().isModified())
-            dirty.push_back(page);
-    }
-    confirmDiscard(dirty, [this, right, alive = std::weak_ptr<bool>(m_alive)] {
-        if (alive.expired())
-            return;
-        for (EditorPage *page : right)
-            closeTab(indexOfPage(page), false);
-    });
-}
-
-void EditorWindow::reopenClosedTab()
-{
-    const std::optional<TabState> state = m_application.takeClosedTab();
-    if (!state || state->draftId.empty())
-        return;
-    if (!state->path.empty() && indexOfPath(state->path, state->path) >= 0) {
-        selectTab(indexOfPath(state->path, state->path));
-        return;
-    }
-    EditorPage::Options options;
-    options.restoreState = state;
-    newTab(options);
-}
-
 void EditorWindow::quitApplication()
 {
-    if (m_application.settings().restoreSession) {
-        m_application.quit();
-        return;
-    }
     std::vector<EditorPage *> dirty;
     for (EditorWindow *window : m_application.windows()) {
         for (EditorPage *page : window->pages()) {
@@ -750,8 +654,6 @@ void EditorWindow::requestClose()
     confirmDiscard(dirty, [this, alive = std::weak_ptr<bool>(m_alive)] {
         if (alive.expired())
             return;
-        for (EditorPage *page : m_pages)
-            page->document().removeDraft();
         m_closeConfirmed = true;
         finishClose();
     });
@@ -932,8 +834,6 @@ void EditorWindow::buildMainMenu()
         recent->addSeparator();
         recent->addItem(tr("Clear Recent Files"), [this] { m_application.recentFiles().clear(); });
     };
-    const size_t reopen = file->addItem(tr("Reopen Closed Tab"), [this] { reopenClosedTab(); });
-    file->setItemKeyEquivalent(reopen, "t", ctrl | shift);
     file->addSeparator();
     const size_t closeTab = file->addItem(tr("Close Tab"), [this] { closeCurrentTab(); });
     file->setItemKeyEquivalent(closeTab, "w", ctrl);
@@ -946,17 +846,13 @@ void EditorWindow::buildMainMenu()
     const size_t saveAllRow = file->addItem(tr("Save All"), [this] { saveAll(); });
     file->setItemKeyEquivalent(saveAllRow, "s", ctrl | alt);
     const size_t revert = file->addItem(tr("Revert to Saved\xE2\x80\xA6"), onPage([](EditorPage &p) { p.revert(); }));
-    file->addSeparator();
-    const size_t statistics = file->addItem(tr("Document Statistics"), [this] { showStatistics(); });
-    file->onAboutToShow = [this, file, recentRow, reopen, save, saveAsRow, revert, statistics] {
+    file->onAboutToShow = [this, file, recentRow, save, saveAsRow, revert] {
         EditorPage *page = currentPage();
         Document *document = page ? &page->document() : nullptr;
         file->setItemEnabled(recentRow, !m_application.recentFiles().files().empty());
-        file->setItemEnabled(reopen, m_application.canReopenClosedTab());
         file->setItemEnabled(save, document != nullptr);
         file->setItemEnabled(saveAsRow, document != nullptr);
         file->setItemEnabled(revert, document && !document->isUntitled() && document->isModified());
-        file->setItemEnabled(statistics, document != nullptr);
     };
 
     Menu *edit = m_mainMenu->addSubmenu(tr("Edit"));
@@ -973,22 +869,6 @@ void EditorWindow::buildMainMenu()
     edit->setItemKeyEquivalent(paste, "v", ctrl);
     const size_t selectAll = edit->addItem(tr("Select All"), onDocument([](Document &d) { d.selectAll(); }));
     edit->setItemKeyEquivalent(selectAll, "a", ctrl);
-    edit->addSeparator();
-    const size_t duplicate = edit->addItem(tr("Duplicate Line"), onDocument([](Document &d) { d.duplicateLines(); }));
-    edit->setItemKeyEquivalent(duplicate, "d", ctrl | alt);
-    const size_t deleteLine = edit->addItem(tr("Delete Line"), onDocument([](Document &d) { d.deleteLines(); }));
-    edit->setItemKeyEquivalent(deleteLine, "d", ctrl);
-    const size_t moveUp = edit->addItem(tr("Move Line Up"), onDocument([](Document &d) { d.moveLines(true); }));
-    edit->setItemKeyEquivalent(moveUp, "Up", alt);
-    const size_t moveDown = edit->addItem(tr("Move Line Down"), onDocument([](Document &d) { d.moveLines(false); }));
-    edit->setItemKeyEquivalent(moveDown, "Down", alt);
-    edit->addSeparator();
-    // TRANSLATORS: changes the selection to upper case; written in the case it applies, as are "lowercase" and "Title Case".
-    const size_t upper = edit->addItem(tr("UPPERCASE"), onDocument([](Document &d) { d.changeCase(Document::Upper); }));
-    edit->setItemKeyEquivalent(upper, "u", ctrl);
-    const size_t lower = edit->addItem(tr("lowercase"), onDocument([](Document &d) { d.changeCase(Document::Lower); }));
-    edit->setItemKeyEquivalent(lower, "u", ctrl | shift);
-    edit->addItem(tr("Title Case"), onDocument([](Document &d) { d.changeCase(Document::Title); }));
     edit->addSeparator();
     const size_t indent = edit->addItem(tr("Indent"), onDocument([](Document &d) { d.indentSelection(false); }));
     edit->setItemKeyEquivalent(indent, "Tab", NoModifier);
@@ -1059,20 +939,11 @@ void EditorWindow::buildMainMenu()
     windowMenu->setItemKeyEquivalent(previousTab, "Tab", ctrl | shift);
     const size_t nextTab = windowMenu->addItem(tr("Show Next Tab"), [this] { cycleTab(1); });
     windowMenu->setItemKeyEquivalent(nextTab, "Tab", ctrl);
-    const size_t moveLeft = windowMenu->addItem(tr("Move Tab Left"), [this] { moveTab(m_currentIndex, m_currentIndex - 1); });
-    const size_t moveRight = windowMenu->addItem(tr("Move Tab Right"), [this] { moveTab(m_currentIndex, m_currentIndex + 1); });
-    windowMenu->onAboutToShow = [this, windowMenu, previousTab, nextTab, moveLeft, moveRight] {
+    windowMenu->onAboutToShow = [this, windowMenu, previousTab, nextTab] {
         const int count = int(m_pages.size());
         windowMenu->setItemEnabled(previousTab, count > 1);
         windowMenu->setItemEnabled(nextTab, count > 1);
-        windowMenu->setItemEnabled(moveLeft, m_currentIndex > 0);
-        windowMenu->setItemEnabled(moveRight, m_currentIndex >= 0 && m_currentIndex < count - 1);
     };
-
-    Menu *help = m_mainMenu->addSubmenu(tr("Help"));
-    help->setRole(MenuRole::Help);
-    const size_t shortcuts = help->addItem(tr("Keyboard Shortcuts"), [this] { showShortcuts(); });
-    help->setItemKeyEquivalent(shortcuts, "?", ctrl);
 
     m_window->setMainMenu(m_mainMenu.get());
 }
@@ -1082,44 +953,6 @@ void EditorWindow::showPreferences()
     if (!m_preferences)
         m_preferences = std::make_unique<PreferencesDialog>(m_window.get(), m_application);
     m_preferences->show();
-}
-
-void EditorWindow::showShortcuts()
-{
-    if (!m_shortcuts)
-        m_shortcuts = std::make_unique<ShortcutsDialog>(m_window.get());
-    m_shortcuts->show();
-}
-
-// A whole number with "," between groups of three digits.
-static std::string localeNumber(int64_t value)
-{
-    std::string digits = std::to_string(value < 0 ? -value : value);
-    for (int i = int(digits.size()) - 3; i > 0; i -= 3)
-        digits.insert(size_t(i), ",");
-    return (value < 0 ? "-" : "") + digits;
-}
-
-void EditorWindow::showStatistics()
-{
-    EditorPage *page = currentPage();
-    if (!page)
-        return;
-    const DocumentStatistics stats = page->document().statistics();
-    std::string text = format(tr("Lines: {count}"), {{"count", localeNumber(stats.lines)}}) + "\n"
-            + format(tr("Words: {count}"), {{"count", localeNumber(stats.words)}}) + "\n"
-            + format(tr("Characters: {count}"), {{"count", localeNumber(stats.characters)}}) + "\n"
-            + format(tr("Characters without spaces: {count}"), {{"count", localeNumber(stats.charactersWithoutSpaces)}});
-    if (stats.hasSelection)
-        // TRANSLATORS: each value is a count with its noun, such as "3 lines".
-        text += "\n\n" + format(tr("Selection: {lines}, {words}, {characters}"),
-                                {{"lines", trn("{n} line", "{n} lines", uint64_t(stats.selectionLines))},
-                                 {"words", trn("{n} word", "{n} words", uint64_t(stats.selectionWords))},
-                                 {"characters", trn("{n} character", "{n} characters", uint64_t(stats.selectionCharacters))}});
-    m_statistics = std::make_unique<ConfirmDialog>(m_window.get(), page->title(), text);
-    m_statistics->setCancelVisible(false);
-    m_statistics->setConfirmText(tr("OK"));
-    m_statistics->show();
 }
 
 void EditorWindow::showAbout()
@@ -1140,21 +973,6 @@ void EditorWindow::showNotification(const std::string &text, int milliseconds)
     m_toast->show(text, std::chrono::milliseconds(milliseconds));
 }
 
-void EditorWindow::moveToNewWindow(int index)
-{
-    if (index < 0 || index >= int(m_pages.size()) || m_pages.size() < 2)
-        return;
-    std::unique_ptr<EditorPage> page = takePage(index);
-    Options options;
-    options.detachedPage = std::move(page);
-    options.size = m_window->size();
-    options.zoom = m_zoom;
-    options.restoresSize = false;
-    m_application.newWindow(std::move(options));
-}
-
-// A tab pulled off the bar: a window of its own under the pointer, carried
-// by the drag until it is dropped on a tab bar or let go.
 void EditorWindow::openTabMenu(int index, PointF position)
 {
     if (index < 0 || index >= int(m_pages.size()))
@@ -1162,27 +980,18 @@ void EditorWindow::openTabMenu(int index, PointF position)
     m_tabMenuIndex = index;
     m_tabMenu = std::make_unique<Menu>();
     const std::string path = m_pages[size_t(index)]->document().filePath();
-    const size_t move = m_tabMenu->addItem(tr("Move to New Window"), [this] {
-        cutefish::base::EventLoop::current()->post([this, index = m_tabMenuIndex, alive = std::weak_ptr<bool>(m_alive)] {
-            if (!alive.expired())
-                moveToNewWindow(index);
-        });
-    });
-    m_tabMenu->setItemEnabled(move, m_pages.size() > 1);
     if (!path.empty()) {
         EditorApplication &application = m_application;
         m_tabMenu->addItem(tr("Copy Path"), [&application, path] { application.copyText(path); });
         m_tabMenu->addItem(tr("Show in Folder"), [&application, path] { application.showInFileManager(path); });
+        m_tabMenu->addSeparator();
     }
-    m_tabMenu->addSeparator();
     m_tabMenu->addItem(tr("Close Tab"), [this] { closeTab(m_tabMenuIndex); }, "Ctrl+W");
-    if (m_pages.size() > 1)
-        m_tabMenu->addItem(tr("Close Other Tabs"), [this] { closeOtherTabs(m_tabMenuIndex); });
-    if (index < int(m_pages.size()) - 1)
-        m_tabMenu->addItem(tr("Close Tabs to the Right"), [this] { closeTabsToRight(m_tabMenuIndex); });
     m_tabMenu->popup(m_window.get(), position);
 }
 
+// A tab pulled off the bar: a window of its own under the pointer, carried
+// by the drag until it is dropped on a tab bar or let go.
 void EditorWindow::detachTab(int index, PointF position)
 {
     if (index < 0 || index >= int(m_pages.size()) || m_pages.size() < 2) {
@@ -1268,13 +1077,10 @@ void EditorWindow::addShortcuts()
     window.addShortcut(ctrl, key::letter('w'), [this] { closeCurrentTab(); });
     window.addShortcut(ctrl | shift, key::letter('w'), [this] { requestClose(); });
     window.addShortcut(ctrl, key::letter('q'), [this] { quitApplication(); });
-    window.addShortcut(ctrl | shift, key::letter('t'), [this] { reopenClosedTab(); });
     window.addShortcut(ctrl, key::PageDown, [this] { cycleTab(1); });
     window.addShortcut(ctrl, key::Tab, [this] { cycleTab(1); });
     window.addShortcut(ctrl, key::PageUp, [this] { cycleTab(-1); });
     window.addShortcut(ctrl | shift, key::Tab, [this] { cycleTab(-1); });
-    window.addShortcut(ctrl | shift, key::PageDown, [this] { moveTab(m_currentIndex, m_currentIndex + 1); });
-    window.addShortcut(ctrl | shift, key::PageUp, [this] { moveTab(m_currentIndex, m_currentIndex - 1); });
     for (int i = 0; i < 9; ++i) {
         window.addShortcut(alt, uint32_t('1' + i), [this, i] { selectTab(i == 8 ? int(m_pages.size()) - 1 : i); });
     }
@@ -1303,10 +1109,4 @@ void EditorWindow::addShortcuts()
     });
     window.addShortcut(NoModifier, f11, [this] { toggleFullScreen(); });
     window.addShortcut(ctrl, ',', [this] { showPreferences(); });
-    window.addShortcut(ctrl | shift, '?', [this] { showShortcuts(); });
-    window.addShortcut(ctrl | shift, '/', [this] { showShortcuts(); });
-    window.addShortcut(ctrl, key::letter('d'), page([](EditorPage &p) { p.document().deleteLines(); }));
-    window.addShortcut(ctrl | alt, key::letter('d'), page([](EditorPage &p) { p.document().duplicateLines(); }));
-    window.addShortcut(ctrl, key::letter('u'), page([](EditorPage &p) { p.document().changeCase(Document::Upper); }));
-    window.addShortcut(ctrl | shift, key::letter('u'), page([](EditorPage &p) { p.document().changeCase(Document::Lower); }));
 }

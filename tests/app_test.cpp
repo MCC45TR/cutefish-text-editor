@@ -7,7 +7,6 @@
 #include "editorview.h"
 #include "editorwindow.h"
 #include "pagebars.h"
-#include "session.h"
 
 #include "base/elapsed_timer.h"
 #include "base/file.h"
@@ -38,14 +37,13 @@ static std::string writeFile(const std::string &name, std::string_view data)
     return path;
 }
 
-// One editor process: its settings in the scratch folder, a fresh session.
+// One editor process, its settings in the scratch folder.
 class AppTest : public ::testing::Test
 {
 protected:
     void SetUp() override
     {
         std::error_code error;
-        fs::remove_all(Session::dataDirectory(), error);
         const std::string conf = TestSupport::directory() + "/text-editor-app.conf";
         fs::remove(conf, error);
         m_settings = std::make_unique<EditorSettings>(conf);
@@ -58,9 +56,10 @@ protected:
         TestSupport::wait(20);
     }
 
-    EditorWindow *start(const std::vector<std::string> &files, SizeF size = {900, 640})
+    EditorWindow *start(const std::vector<std::string> &files, SizeF size = {900, 640},
+                        const std::optional<std::string> &standardInput = std::nullopt)
     {
-        m_app->start(files, TestSupport::directory(), std::nullopt);
+        m_app->start(files, TestSupport::directory(), standardInput);
         if (m_app->windows().empty())
             return nullptr;
         EditorWindow *window = m_app->windows().back();
@@ -105,6 +104,16 @@ static std::string readFile(const std::string &path)
     return cutefish::base::file::read(path).value_or(std::string());
 }
 
+// Answers the dialog asking about unsaved changes with Return: Save.
+static void answerSave(EditorApplication &application)
+{
+    Window *dialog = openDialog(application);
+    ASSERT_TRUE(dialog);
+    TestInput::setKeyboardFocus(*dialog, true);
+    TestInput::typeKey(*dialog, key::Return);
+    TestSupport::wait(5);
+}
+
 // Files dragged in from another client, which answers only when told to.
 class SlowFileOffer : public DropOffer
 {
@@ -123,6 +132,30 @@ public:
 private:
     std::vector<std::string> m_types{"text/uri-list"};
     std::function<void(std::string data)> m_done;
+};
+
+// Text dragged within one view, with the action the compositor picked.
+class SelfTextOffer : public DropOffer
+{
+public:
+    SelfTextOffer(const void *view, std::string text)
+        : m_text(std::move(text))
+    {
+        m_source.context = view;
+    }
+
+    const std::vector<std::string> &mimeTypes() const override { return m_types; }
+    uint32_t sourceActions() const override { return CopyAction | MoveAction; }
+    void read(const std::string &, std::function<void(std::string data)> done) override { done(m_text); }
+    const DragSource *localSource() const override { return &m_source; }
+    uint32_t action() const override { return picked; }
+
+    uint32_t picked = NoAction;
+
+private:
+    std::vector<std::string> m_types{"text/plain;charset=utf-8", "text/plain"};
+    std::string m_text;
+    DragSource m_source;
 };
 
 TEST_F(AppTest, OpensFileAndTypes)
@@ -162,7 +195,7 @@ TEST_F(AppTest, WindowShowsItsMenusInTheStatusBar)
     Menu *menu = window->window().mainMenu();
     ASSERT_TRUE(menu);
     const std::vector<MenuRole> roles {MenuRole::Application, MenuRole::None, MenuRole::None, MenuRole::None,
-                                       MenuRole::Windows, MenuRole::Help};
+                                       MenuRole::Windows};
     for (size_t i = 0; i < roles.size(); ++i) {
         ASSERT_TRUE(menu->submenu(i)) << i;
         EXPECT_EQ(menu->submenu(i)->role(), roles[i]) << i;
@@ -240,9 +273,9 @@ TEST_F(AppTest, ScrollBarDrag)
     EXPECT_GT(view->contentY(), 100 * view->lineHeight());
 }
 
-TEST_F(AppTest, TabsAndSession)
+TEST_F(AppTest, Tabs)
 {
-    const std::string a = writeFile("a.txt", "first file\n");
+    const std::string a = writeFile("a.txt", "first file\nsecond line\n");
     const std::string b = writeFile("b.md", "# Title\n\nSome *text*.\n");
     EditorWindow *window = start({a, b});
     ASSERT_TRUE(window);
@@ -254,31 +287,10 @@ TEST_F(AppTest, TabsAndSession)
 
     TestInput::typeKey(window->window(), key::letter('t'), ControlModifier);
     EXPECT_EQ(window->tabCount(), 3);
-    TestInput::typeText(window->window(), "draft text");
-    EXPECT_EQ(window->currentPage()->title(), "draft text");
-
-    m_app->saveSession();
-    window->currentPage()->document().writeDraftNow();
-    const std::vector<WindowState> session = Session::load();
-    ASSERT_EQ(session.size(), 1u);
-    ASSERT_EQ(session.front().tabs.size(), 3u);
-    EXPECT_TRUE(session.front().tabs.at(2).unsaved);
-    EXPECT_EQ(session.front().current, 2);
-
-    // A new process restores it, the untitled text included.
-    m_app = std::make_unique<EditorApplication>(*m_settings);
-    EditorWindow *restored = start({});
-    ASSERT_TRUE(restored);
-    EXPECT_EQ(restored->tabCount(), 3);
-    EXPECT_EQ(restored->currentPage()->document().text(), "draft text");
-    EXPECT_TRUE(restored->currentPage()->document().isModified());
-
-    // Closing a tab can be undone.
-    restored->closeTab(0, false);
-    EXPECT_EQ(restored->tabCount(), 2);
-    EXPECT_TRUE(m_app->canReopenClosedTab());
-    TestInput::typeKey(restored->window(), key::letter('t'), ControlModifier | ShiftModifier);
-    EXPECT_EQ(restored->tabCount(), 3);
+    TestInput::typeText(window->window(), "untitled text");
+    EXPECT_EQ(window->currentPage()->title(), "untitled text");
+    window->closeTab(2, false);
+    EXPECT_EQ(window->tabCount(), 2);
 }
 
 TEST_F(AppTest, CrowdedTabs)
@@ -452,7 +464,6 @@ TEST_F(AppTest, WrappingAndDialogs)
     EXPECT_GT(wrapped.column, 2);
 
     window->showPreferences();
-    window->showShortcuts();
     TestSupport::wait(30);
 }
 
@@ -481,35 +492,21 @@ TEST_F(AppTest, PreeditShowsAtTheCursor)
 TEST_F(AppTest, CloseLastWindow)
 {
     for (const bool modified : {false, true}) {
-        for (const bool restore : {true, false}) {
-            SCOPED_TRACE(std::to_string(modified) + std::to_string(restore));
-            m_settings->restoreSession = restore;
-            m_app = std::make_unique<EditorApplication>(*m_settings);
-            std::error_code error;
-            fs::remove_all(Session::dataDirectory(), error);
-            EditorWindow *window = start({writeFile("last.txt", "text\n")});
-            ASSERT_TRUE(window);
-            if (modified)
-                window->currentPage()->document().insertText("more ");
-            window->requestClose();
-            if (modified && !restore) {
-                // Unsaved changes are asked about first: Don't Save.
-                bool found = false;
-                for (Window *w : cutefish::ui::Application::instance()->windows()) {
-                    if (w != &window->window() && !w->isHidden())
-                        found = true;
-                }
-                EXPECT_TRUE(found);
-                EXPECT_FALSE(m_app->isQuitting());
-                m_app->quit();
-            }
-            EXPECT_TRUE(m_app->isQuitting());
-            if (restore) {
-                const std::vector<WindowState> session = Session::load();
-                ASSERT_EQ(session.size(), 1u);
-                EXPECT_EQ(session.front().tabs.front().unsaved, modified);
-            }
+        SCOPED_TRACE(modified);
+        m_app = std::make_unique<EditorApplication>(*m_settings);
+        EditorWindow *window = start({writeFile("last.txt", "text\n")});
+        ASSERT_TRUE(window);
+        if (modified)
+            window->currentPage()->document().insertText("more ");
+        window->requestClose();
+        if (modified) {
+            // Unsaved changes are asked about first: Don't Save.
+            EXPECT_TRUE(openDialog(*m_app));
+            EXPECT_FALSE(m_app->isQuitting());
+            m_app->quit();
         }
+        EXPECT_TRUE(m_app->isQuitting());
+        EXPECT_EQ(readFile(TestSupport::directory() + "/last.txt"), "text\n");
     }
 }
 
@@ -600,17 +597,13 @@ TEST_F(AppTest, SaveAllAndSaveChanges)
 
 TEST_F(AppTest, QuitDialogSkipsPagesClosedMeanwhile)
 {
-    m_settings->restoreSession = false;
     const std::string first = writeFile("first.txt", "first\n");
     const std::string second = writeFile("second.txt", "second\n");
     EditorWindow *window = start({first});
     ASSERT_TRUE(window);
     window->currentPage()->document().insertText("edit ");
-    EditorWindow::Options options;
-    options.initialTabs = {TabState{}};
-    options.initialTabs.front().path = second;
-    options.initialTabs.front().draftId = "second";
-    EditorWindow *other = m_app->newWindow(std::move(options));
+    EditorWindow *other = m_app->newWindow();
+    other->openFile(second, 0);
     other->currentPage()->document().waitForLoaded();
     other->currentPage()->document().insertText("edit ");
 
@@ -649,7 +642,8 @@ TEST_F(AppTest, LanguageChangeKeepsTheDocuments)
     Window *dialog = openDialog(*m_app);
     ASSERT_TRUE(dialog);
     const View *question = dialog->contentView();
-    const StatusBar *status = &page->statusBar();
+    // Marked, as the rebuilt bar may take the old one's address.
+    page->statusBar().setName("oldStatusBar");
     const EditorView *view = &page->editor();
 
     cutefish::ui::Application::instance()->languageChanged.emit();
@@ -659,7 +653,7 @@ TEST_F(AppTest, LanguageChangeKeepsTheDocuments)
     EXPECT_EQ(window->currentPage(), untitled);
     EXPECT_EQ(untitled->title(), untitledTitle);
     EXPECT_EQ(&page->editor(), view);
-    EXPECT_NE(&page->statusBar(), status);
+    EXPECT_EQ(page->statusBar().name(), "statusBar");
     EXPECT_EQ(document.text(), text);
     EXPECT_TRUE(document.isModified());
     EXPECT_TRUE(document.canUndo());
@@ -714,4 +708,178 @@ TEST_F(AppTest, FilesArriveAfterTheirTargetCloses)
     onTabs.answer("file://" + late + "\n");
     EXPECT_EQ(window->tabCount(), 1);
     EXPECT_FALSE(m_app->findOpenDocument(late).has_value());
+}
+
+// A selection dragged within the view moves unless the keys picked a copy.
+TEST_F(AppTest, TextDraggedWithinTheViewTakesThePickedAction)
+{
+    EditorWindow *window = start({writeFile("drag.txt", "one two three\n")});
+    ASSERT_TRUE(window);
+    EditorView *view = editor(window);
+    Document &document = *view->document();
+    const PointF end = at(view, {view->geometry().width - 30, 6 + view->lineHeight() * 0.5});
+    const auto dragFirstWord = [&](uint32_t picked) {
+        document.setCursor({0, 4}, {0, 0});
+        SelfTextOffer offer(view, document.selectedText());
+        const uint32_t answer = TestInput::dragEnter(window->window(), end, &offer);
+        EXPECT_EQ(answer, dropActions(CopyAction | MoveAction, MoveAction));
+        offer.picked = picked;
+        TestInput::drop(window->window());
+    };
+
+    dragFirstWord(NoAction);
+    EXPECT_EQ(document.buffer().line(0), "two threeone ");
+    dragFirstWord(CopyAction);
+    EXPECT_EQ(document.buffer().line(0), "two threeone two ");
+    dragFirstWord(MoveAction);
+    EXPECT_EQ(document.buffer().line(0), "threeone two two ");
+}
+
+TEST_F(AppTest, QuitAsksAboutUnsavedDocuments)
+{
+    const std::string path = writeFile("quit.txt", "text\n");
+    EditorWindow *window = start({path});
+    ASSERT_TRUE(window);
+    window->currentPage()->document().insertText("more ");
+
+    TestInput::typeKey(window->window(), key::letter('q'), ControlModifier);
+    Window *dialog = openDialog(*m_app);
+    ASSERT_TRUE(dialog);
+    EXPECT_FALSE(m_app->isQuitting());
+    // Cancel keeps everything open.
+    TestInput::setKeyboardFocus(*dialog, true);
+    TestInput::typeKey(*dialog, key::Escape);
+    TestSupport::wait(5);
+    EXPECT_FALSE(m_app->isQuitting());
+    EXPECT_EQ(m_app->windowCount(), 1);
+    EXPECT_EQ(readFile(path), "text\n");
+
+    TestInput::setKeyboardFocus(window->window(), true);
+    TestInput::typeKey(window->window(), key::letter('q'), ControlModifier);
+    answerSave(*m_app);
+    EXPECT_EQ(readFile(path), "more text\n");
+    EXPECT_TRUE(m_app->isQuitting());
+}
+
+TEST_F(AppTest, StartBringsNothingBack)
+{
+    EditorWindow *window = start({writeFile("previous.txt", "previous\n")});
+    ASSERT_TRUE(window);
+    window->currentPage()->document().insertText("unsaved ");
+    window->newTab();
+    TestInput::typeText(window->window(), "untitled");
+    window->closeTab(0, false);
+    // Asked and answered: Don't Save.
+    m_app->quit();
+    TestSupport::wait(5);
+
+    m_app = std::make_unique<EditorApplication>(*m_settings);
+    EditorWindow *again = start({});
+    ASSERT_TRUE(again);
+    EXPECT_EQ(m_app->windowCount(), 1);
+    EXPECT_EQ(again->tabCount(), 1);
+    EXPECT_TRUE(EditorWindow::isPristine(again->currentPage()));
+}
+
+TEST_F(AppTest, TextFromOutsideAsksBeforeItIsLost)
+{
+    EditorWindow *window = start({}, {900, 640}, std::string("piped text\n"));
+    ASSERT_TRUE(window);
+    EXPECT_EQ(window->tabCount(), 1);
+    EditorPage *piped = window->currentPage();
+    EXPECT_EQ(piped->document().text(), "piped text\n");
+    EXPECT_TRUE(piped->document().isModified());
+    const auto cancel = [this] {
+        Window *dialog = openDialog(*m_app);
+        ASSERT_TRUE(dialog);
+        TestInput::setKeyboardFocus(*dialog, true);
+        TestInput::typeKey(*dialog, key::Escape);
+        TestSupport::wait(5);
+    };
+    window->closeTab(window->indexOfPage(piped));
+    cancel();
+    EXPECT_GE(window->indexOfPage(piped), 0);
+
+    // As the OpenText method hands it over.
+    m_app->openText("sent text");
+    EXPECT_EQ(window->tabCount(), 2);
+    EditorPage *sent = window->currentPage();
+    EXPECT_EQ(sent->document().text(), "sent text");
+    window->closeTab(window->indexOfPage(sent));
+    cancel();
+    EXPECT_GE(window->indexOfPage(sent), 0);
+
+    window->requestClose();
+    cancel();
+    EXPECT_FALSE(m_app->isQuitting());
+    EXPECT_EQ(m_app->windowCount(), 1);
+
+    // A new window takes the text in its own empty tab.
+    EditorWindow *other = m_app->newWindow();
+    m_app->openText("into a new window");
+    EXPECT_EQ(other->tabCount(), 1);
+    EXPECT_EQ(other->currentPage()->document().text(), "into a new window");
+}
+
+TEST_F(AppTest, DeletedFileAsksBeforeClosing)
+{
+    const std::string path = writeFile("deleted.txt", "only here\n");
+    EditorWindow *window = start({path});
+    ASSERT_TRUE(window);
+    Document &document = window->currentPage()->document();
+    fs::remove(path);
+    ASSERT_TRUE(TestSupport::waitUntil([&] { return document.notice() == Document::Deleted; }, 5000));
+    window->requestClose();
+    EXPECT_TRUE(openDialog(*m_app));
+    EXPECT_FALSE(m_app->isQuitting());
+    answerSave(*m_app);
+    EXPECT_EQ(readFile(path), "only here\n");
+    EXPECT_TRUE(m_app->isQuitting());
+}
+
+TEST_F(AppTest, ChangedOnDiskStopsEverySave)
+{
+    const std::string path = writeFile("conflict.txt", "base\n");
+    EditorWindow *window = start({path});
+    ASSERT_TRUE(window);
+    Document &document = window->currentPage()->document();
+    document.insertText("mine ");
+    TestSupport::wait(50);
+    writeFile("conflict.txt", "theirs\n");
+    ASSERT_TRUE(TestSupport::waitUntil([&] { return document.notice() == Document::ChangedOnDisk; }, 5000));
+    const auto refused = [&] {
+        EXPECT_EQ(readFile(path), "theirs\n");
+        EXPECT_EQ(document.notice(), int(Document::ChangedOnDisk));
+        EXPECT_TRUE(document.isModified());
+    };
+
+    TestInput::typeKey(window->window(), key::letter('s'), ControlModifier);
+    refused();
+    window->saveAll();
+    refused();
+
+    // Save in the close dialogs: the save is refused and nothing closes.
+    window->closeTab(0);
+    answerSave(*m_app);
+    EXPECT_EQ(window->tabCount(), 1);
+    refused();
+    EditorWindow *other = m_app->newWindow();
+    TestInput::configure(other->window(), 900, 640, {true});
+    window->requestClose();
+    answerSave(*m_app);
+    EXPECT_EQ(m_app->windowCount(), 2);
+    refused();
+    window->quitApplication();
+    answerSave(*m_app);
+    EXPECT_FALSE(m_app->isQuitting());
+    EXPECT_EQ(m_app->windowCount(), 2);
+    refused();
+
+    // Keep My Version makes the file on disk the one Save may replace.
+    document.keepLocalVersion();
+    TestInput::setKeyboardFocus(window->window(), true);
+    TestInput::typeKey(window->window(), key::letter('s'), ControlModifier);
+    EXPECT_EQ(readFile(path), "mine base\n");
+    EXPECT_FALSE(document.isModified());
+    EXPECT_EQ(document.notice(), int(Document::NoNotice));
 }

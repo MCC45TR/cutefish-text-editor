@@ -90,7 +90,6 @@ EditorPage::EditorPage(EditorApplication &application, EditorWindow *window, con
     m_connections.push_back(document.encodingChanged.connect(status));
     m_connections.push_back(document.lockedChanged.connect(status));
     m_connections.push_back(document.contentsChanged.connect(status));
-    m_connections.push_back(m_editor->overwriteModeChanged.connect(status));
     m_connections.push_back(document.noticeChanged.connect([this] {
         m_infoBar->update();
         requestLayout();
@@ -98,14 +97,8 @@ EditorPage::EditorPage(EditorApplication &application, EditorWindow *window, con
     m_connections.push_back(document.encodingChanged.connect([this] { m_infoBar->update(); }));
     const auto tab = [this] { tabChanged(); };
     m_connections.push_back(document.titleChanged.connect(tab));
-    m_connections.push_back(document.modifiedChanged.connect([this] {
-        tabChanged();
-        m_application.scheduleSessionSave();
-    }));
-    m_connections.push_back(document.filePathChanged.connect([this] {
-        tabChanged();
-        m_application.scheduleSessionSave();
-    }));
+    m_connections.push_back(document.modifiedChanged.connect(tab));
+    m_connections.push_back(document.filePathChanged.connect(tab));
     const auto find = [this] {
         if (m_findBar)
             m_findBar->refresh();
@@ -133,32 +126,8 @@ EditorPage::EditorPage(EditorApplication &application, EditorWindow *window, con
     applySettings();
     const EditorSettings &settings = m_application.settings();
     document.setIndentationDefaults(settings.insertSpaces, settings.tabWidth);
-    if (options.restoreState) {
-        const TabState &state = *options.restoreState;
-        if (!state.draftId.empty())
-            document.setDraftId(state.draftId);
-        chosenEncoding = state.encoding;
-        chosenLanguage = state.language;
-        if (!chosenLanguage.empty())
-            document.setLanguage(chosenLanguage);
-        m_pendingCursor = PendingCursor{state.line, state.column, state.scroll};
-        if (!state.path.empty()) {
-            document.load(state.path, chosenEncoding, !options.fromSession);
-            if (state.unsaved)
-                document.restoreDraft();
-        } else if (state.unsaved) {
-            document.restoreDraft();
-            m_pendingCursor.reset();
-            document.setCursor({state.line, state.column});
-            document.revealCursor();
-            const double scroll = state.scroll;
-            cutefish::base::EventLoop::current()->post([this, scroll, alive = std::weak_ptr<bool>(m_alive)] {
-                if (!alive.expired())
-                    m_editor->scrollToLine(scroll);
-            });
-        }
-    } else if (!options.initialPath.empty()) {
-        m_pendingCursor = PendingCursor{options.initialLine, 0, -1};
+    if (!options.initialPath.empty()) {
+        m_pendingLine = options.initialLine;
         document.load(options.initialPath);
     } else if (options.initialText) {
         document.setText(*options.initialText);
@@ -226,24 +195,8 @@ void EditorPage::focusEditor()
 
 void EditorPage::open(const std::string &path, int line)
 {
-    const int index = line > 0 ? line - 1 : 0;
-    m_pendingCursor = PendingCursor{index, 0, -1};
+    m_pendingLine = line > 0 ? line - 1 : 0;
     m_document->load(path);
-}
-
-TabState EditorPage::sessionState() const
-{
-    const Document &document = *m_document;
-    TabState state;
-    state.path = document.filePath();
-    state.draftId = document.draftId();
-    state.unsaved = document.isModified() || (document.isUntitled() && !document.isEmpty());
-    state.line = document.cursorLine();
-    state.column = document.cursorColumn();
-    state.scroll = m_editor->topLine();
-    state.encoding = chosenEncoding;
-    state.language = chosenLanguage;
-    return state;
 }
 
 void EditorPage::showFind(bool replace)
@@ -329,7 +282,6 @@ void EditorPage::settleScroll()
 
 void EditorPage::setEncodingForReload(const std::string &encoding)
 {
-    chosenEncoding = encoding;
     if (m_document->isModified() && !m_document->isUntitled()) {
         confirmReload(encoding);
         return;
@@ -396,19 +348,14 @@ void EditorPage::popupContextMenu(PointF position)
 
 void EditorPage::onLoaded()
 {
-    if (!m_pendingCursor)
+    if (!m_pendingLine)
         return;
-    const PendingCursor state = *m_pendingCursor;
-    m_pendingCursor.reset();
-    // Columns from the session are bytes; a line from the command line starts its line.
-    m_document->setCursor({state.line, state.column});
+    const int line = *m_pendingLine;
+    m_pendingLine.reset();
+    m_document->setCursor({line, 0});
     m_document->revealCursor();
-    cutefish::base::EventLoop::current()->post([this, state, alive = std::weak_ptr<bool>(m_alive)] {
-        if (alive.expired())
-            return;
-        if (state.scroll >= 0)
-            m_editor->scrollToLine(state.scroll);
-        else
+    cutefish::base::EventLoop::current()->post([this, alive = std::weak_ptr<bool>(m_alive)] {
+        if (!alive.expired())
             m_editor->ensureCursorVisible(true);
     });
 }

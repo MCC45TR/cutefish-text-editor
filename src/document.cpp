@@ -3,7 +3,6 @@
 
 #include "document.h"
 #include "fileoptions.h"
-#include "session.h"
 #include "unicode.h"
 
 #include "base/elapsed_timer.h"
@@ -12,7 +11,6 @@
 #include "base/i18n.h"
 #include "base/paths.h"
 #include "base/strings.h"
-#include "base/uuid.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -232,19 +230,13 @@ int SyntaxStates::advance(const TextBuffer &buffer, int line, int64_t budgetMs, 
     return first;
 }
 
-Document::Document(const std::string &draftId)
-    : m_draftId(draftId.empty() ? cutefish::base::Uuid::generate().toString() : draftId)
+Document::Document()
 {
     m_states.reset(nullptr, 1);
 
     m_highlightTimer.setInterval(0ms);
     m_highlightTimer.setSingleShot(true);
     m_highlightTimer.onTimeout = [this] { highlightSlice(); };
-
-    // Drafts are written a moment after typing stops, never to the file itself.
-    m_draftTimer.setInterval(3000ms);
-    m_draftTimer.setSingleShot(true);
-    m_draftTimer.onTimeout = [this] { writeDraftAsync(); };
 
     m_diskCheckTimer.setInterval(200ms);
     m_diskCheckTimer.setSingleShot(true);
@@ -271,25 +263,6 @@ Document::~Document()
     if (m_loadCancel)
         m_loadCancel->store(true);
     m_loadJob.cancel();
-    waitForDraftWrite();
-}
-
-std::string Document::draftDirectory()
-{
-    return Session::dataDirectory() + "/drafts";
-}
-
-void Document::setDraftId(const std::string &id)
-{
-    if (id.empty() || id == m_draftId)
-        return;
-    m_draftId = id;
-    draftIdChanged();
-}
-
-std::string Document::draftPath() const
-{
-    return draftDirectory() + "/" + m_draftId + ".txt";
 }
 
 // The bytes of the first `units` UTF-16 code units of `text`.
@@ -369,11 +342,10 @@ void Document::updateWritable()
     }
 }
 
-void Document::load(const std::string &path, const std::string &encoding, bool addToRecent)
+void Document::load(const std::string &path, const std::string &encoding)
 {
     cancelLoading();
     setFilePath(path);
-    m_addToRecent = addToRecent;
     m_loading = true;
     m_loadProgress = 0;
     loadingChanged();
@@ -447,14 +419,6 @@ void Document::finishLoad(LoadResult &result)
 
     if (result.error != NoNotice) {
         loadingChanged();
-        // Unsaved text of a file that can no longer be read still comes back.
-        if (m_restoreDraftAfterLoad) {
-            m_restoreDraftAfterLoad = false;
-            if (restoreDraft()) {
-                m_diskDiffers = true;
-                updateModified();
-            }
-        }
         setNotice(result.error == LoadFailed && !exists(m_filePath) && m_modified ? Deleted : Notice(result.error),
                   result.errorString);
         return;
@@ -477,8 +441,8 @@ void Document::finishLoad(LoadResult &result)
     }
     m_formatModified = false;
     m_diskDiffers = false;
-    m_ignoreDisk = false;
     m_diskStamp = result.stamp;
+    m_changedStamp = DiskStamp();
     m_encoding = decoded.encoding;
     m_bom = decoded.bom;
     m_lineEnding = decoded.lineEnding;
@@ -494,7 +458,7 @@ void Document::finishLoad(LoadResult &result)
     m_states.reset(Syntax::language(m_language), m_buffer.lineCount());
 
     if (!m_indentationFromFile || !reloading)
-        applyEditorConfig();
+        detectIndentation();
 
     if (m_locked != decoded.binary) {
         m_locked = decoded.binary;
@@ -530,14 +494,7 @@ void Document::finishLoad(LoadResult &result)
     else
         setNotice(NoNotice);
 
-    if (m_restoreDraftAfterLoad) {
-        m_restoreDraftAfterLoad = false;
-        restoreDraft();
-    } else if (!reloading) {
-        removeDraft();
-    }
-
-    if (!reloading && m_addToRecent && s_recentFilesHook)
+    if (!reloading && s_recentFilesHook)
         s_recentFilesHook(m_filePath);
     loaded();
 }
@@ -573,16 +530,10 @@ void Document::replaceWithReloaded(const std::vector<std::string> &lines)
     m_undo.setClean();
 }
 
-void Document::applyEditorConfig()
+void Document::detectIndentation()
 {
-    const EditorConfig config = m_filePath.empty() ? EditorConfig() : EditorConfig::forFile(m_filePath);
     m_indentationFromFile = false;
-    if (config.insertSpaces || config.indentSize) {
-        m_insertSpaces = config.insertSpaces.value_or(m_insertSpaces);
-        m_indentWidth = config.indentSize.value_or(m_indentWidth);
-        m_tabWidth = config.tabWidth.value_or(m_insertSpaces ? m_tabWidth : m_indentWidth);
-        m_indentationFromFile = true;
-    } else if (const auto detected = FileOptions::detectIndentation(m_buffer.lines())) {
+    if (const auto detected = FileOptions::detectIndentation(m_buffer.lines())) {
         m_insertSpaces = detected->insertSpaces;
         if (detected->insertSpaces)
             m_indentWidth = detected->width;
@@ -590,8 +541,6 @@ void Document::applyEditorConfig()
             m_indentWidth = m_tabWidth;
         m_indentationFromFile = true;
     }
-    m_trimTrailingWhitespace = config.trimTrailingWhitespace.value_or(false);
-    m_finalNewline = config.insertFinalNewline;
     indentationChanged();
 }
 
@@ -622,9 +571,9 @@ void Document::dismissNotice()
 void Document::keepLocalVersion()
 {
     // The disk copy is no longer what the buffer started from.
-    m_ignoreDisk = true;
     m_diskDiffers = true;
     m_diskStamp = stampOf(m_filePath);
+    m_changedStamp = DiskStamp();
     updateModified();
     setNotice(NoNotice);
 }
@@ -658,7 +607,6 @@ void Document::setEncoding(const std::string &encoding)
     m_formatModified = true;
     encodingChanged();
     updateModified();
-    scheduleDraft();
 }
 
 void Document::setBom(bool bom)
@@ -822,7 +770,6 @@ void Document::replace(const TextRange &range, std::string_view input, UndoGroup
     undoChanged();
     contentsChanged();
     updateModified();
-    scheduleDraft();
     updateMatches();
     revealCursor();
 }
@@ -840,7 +787,6 @@ void Document::undo()
     undoChanged();
     contentsChanged();
     updateModified();
-    scheduleDraft();
     updateMatches();
     revealCursor();
 }
@@ -858,7 +804,6 @@ void Document::redo()
     undoChanged();
     contentsChanged();
     updateModified();
-    scheduleDraft();
     updateMatches();
     revealCursor();
 }
@@ -932,20 +877,12 @@ void Document::goToLine(int line, int column)
     revealCursor();
 }
 
-void Document::insertText(std::string_view input, bool overwrite)
+void Document::insertText(std::string_view input)
 {
     std::string text = strings::replaceAll(input, "\r\n", "\n");
     std::replace(text.begin(), text.end(), '\r', '\n');
-    TextRange range = selection();
+    const TextRange range = selection();
     const bool singleLine = text.find('\n') == std::string::npos;
-    if (overwrite && range.isEmpty() && singleLine) {
-        // As many characters as are typed.
-        const std::string &line = m_buffer.line(m_cursor.line);
-        size_t end = size_t(m_cursor.column);
-        for (size_t i = 0; i < text.size() && end < line.size(); i = Unicode::next(text, i))
-            end = Unicode::next(line, end);
-        range.end.column = int(end);
-    }
     const TextPosition end = TextBuffer::endOf(range.start, text);
     const bool typed = Unicode::utf16Length(text) <= 2 && singleLine;
     replace(range, text, typed ? UndoGroup::Typing : UndoGroup::Other, {end, end});
@@ -1143,42 +1080,6 @@ void Document::indentSelection(bool unindent)
     cursorChanged();
 }
 
-void Document::moveLines(bool up)
-{
-    const auto [first, last] = selectedLines(selection());
-    if ((up && first == 0) || (!up && last + 1 >= m_buffer.lineCount()))
-        return;
-    std::string block;
-    for (int line = first; line <= last; ++line) {
-        if (line > first)
-            block += '\n';
-        block += m_buffer.line(line);
-    }
-    const int delta = up ? -1 : 1;
-    const Selection after{{m_cursor.line + delta, m_cursor.column}, {m_anchor.line + delta, m_anchor.column}};
-    if (up) {
-        const std::string above = m_buffer.line(first - 1);
-        replace({{first - 1, 0}, {last, int(m_buffer.line(last).size())}}, block + '\n' + above, UndoGroup::Other, after);
-    } else {
-        const std::string below = m_buffer.line(last + 1);
-        replace({{first, 0}, {last + 1, int(below.size())}}, below + '\n' + block, UndoGroup::Other, after);
-    }
-}
-
-void Document::duplicateLines()
-{
-    const auto [first, last] = selectedLines(selection());
-    std::string block;
-    for (int line = first; line <= last; ++line) {
-        block += '\n';
-        block += m_buffer.line(line);
-    }
-    const int count = last - first + 1;
-    const Selection after{{m_cursor.line + count, m_cursor.column}, {m_anchor.line + count, m_anchor.column}};
-    const TextPosition end{last, int(m_buffer.line(last).size())};
-    replace({end, end}, block, UndoGroup::Other, after);
-}
-
 void Document::deleteLines()
 {
     const auto [first, last] = selectedLines(selection());
@@ -1192,42 +1093,6 @@ void Document::deleteLines()
     const int line = std::min(first, m_buffer.lineCount() - 1 - (last - first + 1));
     const TextPosition at{std::max(0, line), 0};
     replace(range, std::string(), UndoGroup::Other, {at, at});
-}
-
-void Document::changeCase(int change)
-{
-    TextRange range = selection();
-    if (range.isEmpty())
-        range = wordAt(m_cursor);
-    if (range.isEmpty())
-        return;
-    const std::string text = m_buffer.text(range);
-    std::string result;
-    if (change == Upper) {
-        result = Unicode::toUpper(text);
-    } else if (change == Lower) {
-        result = Unicode::toLower(text);
-    } else {
-        const std::string lower = Unicode::toLower(text);
-        bool start = true;
-        for (size_t i = 0; i < lower.size(); i = Unicode::next(lower, i)) {
-            char32_t c = Unicode::at(lower, i);
-            if (Unicode::isLetter(c)) {
-                if (start)
-                    c = Unicode::toTitleCase(c);
-                start = false;
-            } else {
-                start = !Unicode::isLetterOrNumber(c) && c != '\'';
-            }
-            Unicode::append(result, c);
-        }
-    }
-    if (result == text)
-        return;
-    // Case changes can change lengths (e.g. "ß" to "SS").
-    const TextPosition end = TextBuffer::endOf(range.start, result);
-    const bool forward = m_anchor <= m_cursor;
-    replace(range, result, UndoGroup::Other, forward ? Selection{end, range.start} : Selection{range.start, end});
 }
 
 TextRange Document::matchingBracket(const TextPosition &position) const
@@ -1281,47 +1146,6 @@ TextRange Document::matchingBracket(const TextPosition &position) const
         return none;
     }
     return none;
-}
-
-static void countText(std::string_view text, int64_t *characters, int64_t *nonSpace, int64_t *words)
-{
-    bool inWord = false;
-    for (size_t i = 0; i < text.size(); i = Unicode::next(text, i)) {
-        const char32_t c = Unicode::at(text, i);
-        ++*characters;
-        if (Unicode::isSpace(c)) {
-            inWord = false;
-            continue;
-        }
-        ++*nonSpace;
-        // Ideographs count as words of their own.
-        if (Unicode::isIdeograph(c)) {
-            ++*words;
-            inWord = false;
-        } else if (!inWord) {
-            ++*words;
-            inWord = true;
-        }
-    }
-}
-
-DocumentStatistics Document::statistics() const
-{
-    DocumentStatistics result;
-    for (int i = 0; i < m_buffer.lineCount(); ++i) {
-        countText(m_buffer.line(i), &result.characters, &result.charactersWithoutSpaces, &result.words);
-        if (i > 0)
-            ++result.characters;
-    }
-    result.lines = m_buffer.lineCount();
-    if (hasSelection()) {
-        int64_t nonSpace = 0;
-        countText(selectedText(), &result.selectionCharacters, &nonSpace, &result.selectionWords);
-        const TextRange r = selection();
-        result.hasSelection = true;
-        result.selectionLines = r.end.line - r.start.line + 1;
-    }
-    return result;
 }
 
 void Document::setSearch(const std::string &text, bool caseSensitive, bool wholeWords, bool regex, bool inSelection)
@@ -1461,113 +1285,6 @@ int Document::replaceAll(const std::string &replacement)
     return count;
 }
 
-void Document::scheduleDraft()
-{
-    m_draftTimer.start();
-}
-
-// Written whole under a temporary name and renamed over the draft, owner only.
-static void writeDraftFile(const std::string &path, const std::string &text)
-{
-    const std::string directory = parentOf(path);
-    if (::access(directory.c_str(), F_OK) != 0) {
-        std::error_code error;
-        fs::create_directories(directory, error);
-        ::chmod(directory.c_str(), 0700);
-    }
-    std::string temporary = path + ".XXXXXX";
-    const int fd = ::mkostemp(temporary.data(), O_CLOEXEC);
-    if (fd < 0)
-        return;
-    ::fchmod(fd, 0600);
-    std::string_view rest = text;
-    bool ok = true;
-    while (!rest.empty()) {
-        const ssize_t written = ::write(fd, rest.data(), rest.size());
-        if (written < 0 && errno == EINTR)
-            continue;
-        if (written <= 0) {
-            ok = false;
-            break;
-        }
-        rest.remove_prefix(size_t(written));
-    }
-    ok = ok && ::fsync(fd) == 0;
-    ::close(fd);
-    if (!ok || ::rename(temporary.c_str(), path.c_str()) != 0)
-        ::unlink(temporary.c_str());
-}
-
-void Document::waitForDraftWrite()
-{
-    if (m_draftWrite.valid())
-        m_draftWrite.wait();
-}
-
-void Document::writeDraftAsync()
-{
-    if (!m_modified && !(m_filePath.empty() && !isEmpty())) {
-        removeDraft();
-        return;
-    }
-    // One write at a time, so an older text never lands after a newer one.
-    waitForDraftWrite();
-    m_draftWrite = std::async(std::launch::async, writeDraftFile, draftPath(), m_buffer.text());
-}
-
-void Document::writeDraftNow()
-{
-    m_draftTimer.stop();
-    waitForDraftWrite();
-    if (!m_modified && !(m_filePath.empty() && !isEmpty())) {
-        removeDraft();
-        return;
-    }
-    writeDraftFile(draftPath(), m_buffer.text());
-}
-
-void Document::removeDraft()
-{
-    m_draftTimer.stop();
-    waitForDraftWrite();
-    ::unlink(draftPath().c_str());
-}
-
-bool Document::restoreDraft()
-{
-    if (m_loading) {
-        m_restoreDraftAfterLoad = true;
-        return true;
-    }
-    std::optional<std::string> data = cutefish::base::file::read(draftPath());
-    if (!data)
-        return false;
-    const std::string text = Unicode::isValid(*data) ? std::move(*data) : Unicode::sanitized(*data);
-    if (text == m_buffer.text()) {
-        if (m_filePath.empty())
-            m_diskDiffers = !text.empty();
-        updateModified();
-        return true;
-    }
-    const int oldCount = m_buffer.lineCount();
-    m_buffer.setText(text);
-    m_undo.clear();
-    m_undo.setCleanUnreachable();
-    m_states.reset(m_states.language(), m_buffer.lineCount());
-    m_cursor = m_anchor = m_buffer.clamp(m_cursor);
-    if (m_filePath.empty())
-        detectLanguage();
-    linesChanged(0, oldCount, m_buffer.lineCount());
-    contentsChanged();
-    titleChanged();
-    undoChanged();
-    cursorChanged();
-    updateModified();
-    if (!m_filePath.empty())
-        setNotice(Restored);
-    return true;
-}
-
 void Document::checkDisk()
 {
     if (m_filePath.empty() || m_loading)
@@ -1578,7 +1295,7 @@ void Document::checkDisk()
 
     if (!stamp.isValid()) {
         if (m_notice != Deleted) {
-            // Quitting must keep the text: the file is gone.
+            // Closing or quitting must ask: the file is gone.
             m_diskDiffers = true;
             updateModified();
             setNotice(Deleted);
@@ -1587,17 +1304,15 @@ void Document::checkDisk()
     }
 
     const bool returned = m_notice == Deleted;
-    if (!returned && stamp == m_diskStamp)
+    if (!returned && (stamp == m_diskStamp || stamp == m_changedStamp))
         return;
-    if (m_ignoreDisk && !returned) {
-        m_diskStamp = stamp;
-        return;
-    }
     if (!m_modified || (returned && m_undo.isClean() && !m_formatModified)) {
         reload();
         return;
     }
-    m_diskStamp = stamp;
+    // m_diskStamp stays what the buffer started from, so Save refuses until
+    // the user keeps their version or reloads.
+    m_changedStamp = stamp;
     setNotice(ChangedOnDisk);
 }
 
@@ -1645,7 +1360,7 @@ bool Document::saveAsUtf8()
     return true;
 }
 
-// umask() can only be read by changing it, which races with the draft writer.
+// umask() can only be read by changing it, which races with other threads.
 static mode_t currentUmask()
 {
     const std::optional<std::string> status = cutefish::base::file::read("/proc/self/status");
@@ -1737,7 +1452,7 @@ bool Document::write(const std::string &path, const std::string &encoding, bool 
     const bool samePath = !m_filePath.empty() && absolutePath(path) == m_filePath;
 
     // Someone else's change since it was loaded is not overwritten unasked.
-    if (samePath && !newFile && !m_ignoreDisk && m_diskStamp.isValid()) {
+    if (samePath && !newFile && m_diskStamp.isValid()) {
         if (!(stampOf(path) == m_diskStamp)) {
             setNotice(ChangedOnDisk);
             return false;
@@ -1749,26 +1464,16 @@ bool Document::write(const std::string &path, const std::string &encoding, bool 
         return false;
     }
 
-    // EditorConfig's whitespace rules go into the file first and into the buffer,
-    // as one undo step, only once it is written.
-    const bool finalNewline = m_finalNewline.value_or(newFile);
-    const bool needsNewline = finalNewline && !m_buffer.line(m_buffer.lineCount() - 1).empty() && !isEmpty();
-    const bool reformat = (m_trimTrailingWhitespace || needsNewline) && !m_locked;
-    std::vector<std::string> trimmedLines;
-    if (reformat) {
-        trimmedLines = m_buffer.lines();
-        if (m_trimTrailingWhitespace) {
-            for (std::string &text : trimmedLines) {
-                size_t end = text.size();
-                while (end > 0 && (text[end - 1] == ' ' || text[end - 1] == '\t'))
-                    --end;
-                text.resize(end);
-            }
-        }
-        if (needsNewline)
-            trimmedLines.emplace_back();
+    // A new file ends with a line break; an existing one is left as it is. The
+    // break goes into the file first and into the buffer, as one undo step,
+    // only once it is written.
+    const bool needsNewline = newFile && !m_buffer.line(m_buffer.lineCount() - 1).empty() && !isEmpty() && !m_locked;
+    std::vector<std::string> withNewline;
+    if (needsNewline) {
+        withNewline = m_buffer.lines();
+        withNewline.emplace_back();
     }
-    const std::vector<std::string> &lines = reformat ? trimmedLines : m_buffer.lines();
+    const std::vector<std::string> &lines = needsNewline ? withNewline : m_buffer.lines();
 
     bool lossy = false;
     const std::string bytes = TextCodec::encode(lines, encoding, bom, m_lineEnding, &lossy);
@@ -1798,31 +1503,18 @@ bool Document::write(const std::string &path, const std::string &encoding, bool 
         return false;
     }
 
-    if (reformat) {
+    if (needsNewline) {
         beginEdit();
-        if (m_trimTrailingWhitespace) {
-            for (int line = 0; line < m_buffer.lineCount(); ++line) {
-                const std::string &text = m_buffer.line(line);
-                const int end = int(lines[size_t(line)].size());
-                if (end < int(text.size())) {
-                    const TextPosition cursor = m_cursor.line == line ? TextPosition{line, std::min(m_cursor.column, end)}
-                                                                      : m_cursor;
-                    replace({{line, end}, {line, int(text.size())}}, std::string(), UndoGroup::Other, {cursor, cursor});
-                }
-            }
-        }
-        if (needsNewline)
-            replace({m_buffer.end(), m_buffer.end()}, "\n", UndoGroup::Other, {m_cursor, m_anchor});
+        replace({m_buffer.end(), m_buffer.end()}, "\n", UndoGroup::Other, {m_cursor, m_anchor});
         endEdit();
     }
 
     m_diskStamp = stampOf(target);
+    m_changedStamp = DiskStamp();
     m_undo.setClean();
     m_formatModified = false;
     m_diskDiffers = false;
-    m_ignoreDisk = false;
     updateModified();
-    removeDraft();
     if (m_notice != Malformed && m_notice != Binary)
         setNotice(NoNotice);
     undoChanged();

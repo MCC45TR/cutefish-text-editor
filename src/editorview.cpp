@@ -149,6 +149,7 @@ EditorView::EditorView()
 {
     setName("editorView");
     setCursorShape(CursorShape::Text);
+    setTracksHover(true);
     m_verticalBar->onPositionRequested = [this](double y) {
         if (m_scroller)
             m_scroller->cancel(false);
@@ -276,15 +277,6 @@ void EditorView::setAutoIndent(bool indent)
         return;
     m_autoIndent = indent;
     optionsChanged();
-}
-
-void EditorView::setOverwriteMode(bool overwrite)
-{
-    if (m_overwrite == overwrite)
-        return;
-    m_overwrite = overwrite;
-    polish();
-    overwriteModeChanged();
 }
 
 void EditorView::setDarkMode(bool dark)
@@ -1117,11 +1109,8 @@ void EditorView::plan()
 
     if (cursor.line >= firstLine && cursor.line <= lastLine) {
         const RectF caret = caretRect(cursor);
-        if (caret.width > 0) {
+        if (caret.width > 0)
             m_caret = {caret.x + textLeft() - m_contentX, caret.y - m_contentY, caret.width, caret.height};
-            if (m_overwrite && selection.isEmpty() && m_preedit.empty())
-                m_caret.width = std::max(m_caret.width, m_charWidth);
-        }
         if (m_highlightCurrentLine && selection.isEmpty()) {
             const double top = lineTop(cursor.line) - m_contentY;
             m_underlay.push_back({{0, top, width, m_lines[size_t(cursor.line)].visualLines * m_lineHeight},
@@ -1195,7 +1184,7 @@ void EditorView::paint(Painter &painter)
     const Window *window = this->window();
     const bool showCaret = hasFocus() && m_caretVisible && m_caret.width > 0 && window && window->isActive();
     if (showCaret)
-        painter.fillRect(snapped(m_caret), m_overwrite && m_caret.width > 3 ? m_theme.selection : m_theme.text);
+        painter.fillRect(snapped(m_caret), m_theme.text);
     if (m_dropCaret.width > 0)
         painter.fillRect(snapped(m_dropCaret), m_theme.text);
 
@@ -1395,7 +1384,7 @@ void EditorView::typeText(std::string_view text)
     if (!m_document)
         return;
     m_preferredX = -1;
-    m_document->insertText(text, m_overwrite);
+    m_document->insertText(text);
 }
 
 void EditorView::cut()
@@ -1523,10 +1512,6 @@ bool EditorView::keyPress(const KeyEvent &event)
     case key::Down: {
         const bool up = key == key::Up;
         resetBlink();
-        if (alt && !shift && !ctrl) {
-            m_document->moveLines(up);
-            return true;
-        }
         if (ctrl) {
             // Scrolls by a line without moving the cursor.
             applyScroll(m_contentX, m_contentY + (up ? -m_lineHeight : m_lineHeight));
@@ -1590,11 +1575,6 @@ bool EditorView::keyPress(const KeyEvent &event)
         }
         return true;
     }
-    case key::Insert:
-        if (mods != NoModifier)
-            return false;
-        setOverwriteMode(!m_overwrite);
-        return true;
     default:
         break;
     }
@@ -1687,6 +1667,10 @@ void EditorView::selectByUnit(const TextPosition &position)
 
 CursorShape EditorView::cursorShape() const
 {
+    for (const ScrollBar *bar : {m_verticalBar, m_horizontalBar}) {
+        if (bar->isVisible() && bar->isNeeded() && bar->geometry().contains(m_lastMouse))
+            return CursorShape::Default;
+    }
     return m_lineNumbers && m_lastMouse.x < gutterWidth() ? CursorShape::Default : CursorShape::Text;
 }
 
@@ -1874,6 +1858,12 @@ void EditorView::dragEnter(const DragEvent &event)
     dragUpdate(event);
 }
 
+uint32_t EditorView::textDropActions(const DropOffer *offer) const
+{
+    const bool fromSelf = offer && offer->localSource() && offer->localSource()->context == this;
+    return fromSelf ? dropActions(CopyAction | MoveAction, MoveAction) : uint32_t(CopyAction);
+}
+
 uint32_t EditorView::dragUpdate(const DragEvent &event)
 {
     if (event.offer && event.offer->hasMimeType("text/uri-list"))
@@ -1883,9 +1873,7 @@ uint32_t EditorView::dragUpdate(const DragEvent &event)
     m_dropCaret = caret.width > 0 ? RectF{caret.x + textLeft() - m_contentX, caret.y - m_contentY, caret.width, caret.height}
                                   : RectF{};
     requestPaint();
-    const bool fromSelf = event.offer && event.offer->localSource() && event.offer->localSource()->context == this;
-    const bool copy = (event.modifiers & ControlModifier) || !fromSelf;
-    return copy ? CopyAction : MoveAction;
+    return textDropActions(event.offer);
 }
 
 void EditorView::dragLeave()
@@ -1921,8 +1909,7 @@ uint32_t EditorView::drop(const DragEvent &event)
     if (m_document->isLocked())
         return NoAction;
     TextPosition position = hitTest(event.position);
-    const bool fromSelf = offer->localSource() && offer->localSource()->context == this;
-    const bool move = fromSelf && !(event.modifiers & ControlModifier);
+    const bool move = takenDropAction(textDropActions(offer), offer->action()) == MoveAction;
 
     if (move) {
         const TextRange range = m_document->selection();

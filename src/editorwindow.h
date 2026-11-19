@@ -5,7 +5,6 @@
 #define EDITORWINDOW_H
 
 #include "editorpage.h"
-#include "session.h"
 
 #include "base/signal.h"
 #include "ui/geometry.h"
@@ -18,7 +17,6 @@
 
 namespace cutefish::ui {
 class AboutDialog;
-class ConfirmDialog;
 class FileChooser;
 class HeaderButton;
 class Menu;
@@ -31,7 +29,6 @@ class WindowHeader;
 class EditorApplication;
 class PreferencesDialog;
 class SaveChangesDialog;
-class ShortcutsDialog;
 
 // A window of tabs, each a document.
 class EditorWindow
@@ -39,9 +36,6 @@ class EditorWindow
 public:
     struct Options
     {
-        // Tabs to open with, from a restored session.
-        std::vector<TabState> initialTabs;
-        int initialIndex = 0;
         // A tab pulled out of another window, which this window opens with.
         std::unique_ptr<EditorPage> detachedPage;
         cutefish::ui::SizeF size;
@@ -81,15 +75,11 @@ public:
     void openFile(const std::string &path, int line);
     void openText(const std::string &text);
     void openPaths(const std::vector<std::string> &paths);
-    std::vector<TabState> sessionTabs() const;
 
     // Asks about unsaved pages, then runs `action` unless the user cancels.
     void confirmDiscard(const std::vector<EditorPage *> &dirty, std::function<void()> action);
     void closeTab(int index, bool ask = true);
     void closeCurrentTab();
-    void closeOtherTabs(int index);
-    void closeTabsToRight(int index);
-    void reopenClosedTab();
     void quitApplication();
     // The close button, or Ctrl+Shift+W.
     void requestClose();
@@ -102,17 +92,14 @@ public:
     void saveAll();
     void openDialog();
 
-    // Move to New Window, Copy Path, Show in Folder and the closing items.
+    // Copy Path, Show in Folder and Close Tab.
     void openTabMenu(int index, cutefish::ui::PointF position);
     void showPreferences();
-    void showShortcuts();
-    void showStatistics();
     void showAbout();
     void showNotification(const std::string &text, int milliseconds);
 
     void insertTab(std::unique_ptr<EditorPage> page, int index);
     std::unique_ptr<EditorPage> takePage(int index);
-    void moveToNewWindow(int index);
     void detachTab(int index, cutefish::ui::PointF position);
     // The page this window was carried with, taken by the tab bar it was dropped on.
     std::unique_ptr<EditorPage> takeDetachedPage();
@@ -160,9 +147,7 @@ private:
     std::unique_ptr<cutefish::ui::FileChooser> m_saveChooser;
     std::unique_ptr<SaveChangesDialog> m_saveDialog;
     std::unique_ptr<PreferencesDialog> m_preferences;
-    std::unique_ptr<ShortcutsDialog> m_shortcuts;
     std::unique_ptr<cutefish::ui::AboutDialog> m_about;
-    std::unique_ptr<cutefish::ui::ConfirmDialog> m_statistics;
     std::unique_ptr<cutefish::ui::Toast> m_toast;
     std::vector<cutefish::base::Subscription> m_connections;
     cutefish::base::Subscription m_languageChanged;

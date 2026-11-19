@@ -19,13 +19,11 @@
 #include <algorithm>
 #include <filesystem>
 
-using namespace std::chrono_literals;
 using cutefish::i18n::tr;
 namespace fs = std::filesystem;
 namespace strings = cutefish::base::strings;
 namespace dbus = cutefish::base::dbus;
 
-static constexpr size_t closedTabLimit = 20;
 static constexpr const char *serviceName = "org.cutefish.TextEditor";
 static constexpr const char *servicePath = "/TextEditor";
 
@@ -42,10 +40,6 @@ EditorApplication::EditorApplication(EditorSettings &settings)
     : m_settings(settings)
     , m_recentFiles(settings.path())
 {
-    m_sessionTimer.setSingleShot(true);
-    m_sessionTimer.setInterval(1000ms);
-    m_sessionTimer.onTimeout = [this] { saveSession(); };
-
     Document::setRecentFilesHook([this](const std::string &path) { m_recentFiles.add(path); });
 }
 
@@ -111,7 +105,6 @@ EditorWindow *EditorApplication::newWindow(EditorWindow::Options options)
     m_lastActive = raw;
     raw->window().show();
     windowCountChanged();
-    scheduleSessionSave();
     return raw;
 }
 
@@ -129,7 +122,6 @@ void EditorApplication::releaseWindow(EditorWindow *window)
     m_windows.erase(it);
     cutefish::base::EventLoop::current()->post([doomed] {});
     windowCountChanged();
-    scheduleSessionSave();
 }
 
 void EditorApplication::windowActivated(EditorWindow *window)
@@ -248,9 +240,6 @@ bool EditorApplication::registerService()
 void EditorApplication::start(const std::vector<std::string> &arguments, const std::string &workingDirectory,
                         const std::optional<std::string> &standardInput)
 {
-    // With restoring off the session is removed on a clean quit, so one that
-    // is still there was left by a crash and comes back anyway.
-    restore();
     if (!arguments.empty())
         open(arguments, workingDirectory);
     if (standardInput)
@@ -259,105 +248,8 @@ void EditorApplication::start(const std::vector<std::string> &arguments, const s
         newWindow();
 }
 
-void EditorApplication::restore()
-{
-    bool ok = true;
-    const std::vector<WindowState> session = Session::load(Session::defaultPath(), &ok);
-    for (const WindowState &state : session) {
-        EditorWindow::Options options;
-        options.initialTabs = state.tabs;
-        options.initialIndex = state.current;
-        newWindow(std::move(options));
-    }
-    // Drafts nothing refers to are left over from a closed tab or a crash;
-    // they are kept a week, and all of them when the session is unreadable.
-    if (ok)
-        Session::removeOrphanDrafts(Document::draftDirectory(), liveDraftIds(), 7);
-}
-
-std::set<std::string> EditorApplication::liveDraftIds() const
-{
-    std::set<std::string> ids;
-    for (const WindowState &state : Session::load()) {
-        for (const TabState &tab : state.tabs)
-            ids.insert(tab.draftId);
-    }
-    for (const TabState &closed : m_closedTabs)
-        ids.insert(closed.draftId);
-    return ids;
-}
-
-void EditorApplication::pushClosedTab(const TabState &state)
-{
-    m_closedTabs.push_back(state);
-    while (m_closedTabs.size() > closedTabLimit) {
-        const TabState dropped = m_closedTabs.front();
-        m_closedTabs.erase(m_closedTabs.begin());
-        if (dropped.unsaved) {
-            std::error_code error;
-            fs::remove(Document::draftDirectory() + "/" + dropped.draftId + ".txt", error);
-        }
-    }
-    closedTabsChanged();
-}
-
-std::optional<TabState> EditorApplication::takeClosedTab()
-{
-    if (m_closedTabs.empty())
-        return std::nullopt;
-    TabState state = m_closedTabs.back();
-    m_closedTabs.pop_back();
-    closedTabsChanged();
-    return state;
-}
-
-void EditorApplication::scheduleSessionSave()
-{
-    if (!m_quitting)
-        m_sessionTimer.start();
-}
-
-void EditorApplication::saveSession()
-{
-    m_sessionTimer.stop();
-    std::vector<WindowState> session;
-    for (EditorWindow *window : m_order) {
-        if (window->window().isHidden())
-            continue;
-        WindowState state;
-        state.tabs = window->sessionTabs();
-        state.current = window->currentIndex();
-        session.push_back(std::move(state));
-    }
-    Session::save(session);
-}
-
-void EditorApplication::flushDrafts()
-{
-    // Every unsaved text goes to its draft before the session points at it.
-    for (EditorWindow *window : m_order) {
-        for (EditorPage *page : window->pages())
-            page->document().writeDraftNow();
-    }
-}
-
-void EditorApplication::terminate()
-{
-    flushDrafts();
-    saveSession();
-    m_quitting = true;
-    cutefish::base::EventLoop::current()->post([] { cutefish::ui::Application::instance()->quit(); });
-}
-
 void EditorApplication::quit()
 {
-    flushDrafts();
-    saveSession();
-    if (!m_settings.restoreSession) {
-        // Asked and answered already: nothing comes back next time.
-        Session::remove();
-        Session::removeOrphanDrafts(Document::draftDirectory(), {});
-    }
     m_quitting = true;
     // Later: this is called from handlers of the windows quitting closes.
     cutefish::base::EventLoop::current()->post([] { cutefish::ui::Application::instance()->quit(); });
